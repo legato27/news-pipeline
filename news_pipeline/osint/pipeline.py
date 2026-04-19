@@ -252,11 +252,6 @@ def process_batch(limit: int = 200) -> dict:
 
                 if existing_event_id:
                     art.event_id = existing_event_id
-                    session.execute(
-                        osint_event_articles.insert().values(
-                            event_id=existing_event_id, content_hash=art.content_hash
-                        ).prefix_with("ON CONFLICT DO NOTHING", dialect="postgresql")
-                    )
                     stats["clustered"] += 1
                 else:
                     # Derive event_type: source-native first, LLM zero-shot as fallback
@@ -292,12 +287,18 @@ def process_batch(limit: int = 200) -> dict:
                         primary_article_url=art.url,
                     ))
                     art.event_id = event_id
-                    session.execute(
-                        osint_event_articles.insert().values(
-                            event_id=event_id, content_hash=art.content_hash
-                        )
-                    )
                     stats["new_events"] += 1
+
+                # FLUSH so the OsintEvent (and any new OsintActor adds) are visible
+                # before we execute the m2m inserts whose FKs reference them.
+                session.flush()
+
+                # Now FK-safe: link article ↔ event
+                session.execute(
+                    osint_event_articles.insert().values(
+                        event_id=art.event_id, content_hash=art.content_hash
+                    ).prefix_with("ON CONFLICT DO NOTHING", dialect="postgresql")
+                )
 
                 # Qdrant upsert (only after event_id is known)
                 if emb is not None:
@@ -311,15 +312,14 @@ def process_batch(limit: int = 200) -> dict:
                         title=art.title,
                     )
 
-                # Link actors to the event
+                # Link actors to the event (actors were added earlier in this
+                # iteration and are already flushed by the flush above).
                 for actor_id, _kind, _name, role in actor_resolutions:
                     session.execute(
                         osint_actor_events.insert().values(
                             actor_id=actor_id, event_id=art.event_id, role=role
                         ).prefix_with("ON CONFLICT DO NOTHING", dialect="postgresql")
                     )
-
-                session.flush()
             except Exception as e:
                 session.rollback()
                 stats["failed"] += 1
