@@ -294,10 +294,11 @@ def process_batch(limit: int = 200) -> dict:
                 session.flush()
 
                 # Now FK-safe: link article ↔ event
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
                 session.execute(
-                    osint_event_articles.insert().values(
+                    pg_insert(osint_event_articles).values(
                         event_id=art.event_id, content_hash=art.content_hash
-                    ).prefix_with("ON CONFLICT DO NOTHING", dialect="postgresql")
+                    ).on_conflict_do_nothing()
                 )
 
                 # Qdrant upsert (only after event_id is known)
@@ -316,9 +317,9 @@ def process_batch(limit: int = 200) -> dict:
                 # iteration and are already flushed by the flush above).
                 for actor_id, _kind, _name, role in actor_resolutions:
                     session.execute(
-                        osint_actor_events.insert().values(
+                        pg_insert(osint_actor_events).values(
                             actor_id=actor_id, event_id=art.event_id, role=role
-                        ).prefix_with("ON CONFLICT DO NOTHING", dialect="postgresql")
+                        ).on_conflict_do_nothing()
                     )
             except Exception as e:
                 session.rollback()
