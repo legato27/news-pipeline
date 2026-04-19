@@ -8,6 +8,8 @@ dependencies = [
     "httpx>=0.27",
     "feedparser>=6.0",
     "vaderSentiment>=3.3",
+    # Option A: vLLM + Qdrant infrastructure
+    "qdrant-client>=1.9",
 ]
 
 [project.optional-dependencies]

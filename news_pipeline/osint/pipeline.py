@@ -1,24 +1,23 @@
-"""OSINT processing pipeline.
+"""OSINT processing pipeline (Option A: vLLM + Qdrant + local spaCy).
 
 Per unprocessed article:
-  1. Translate non-English body to English via DGX /v1/translate.
-  2. NER on (title + translated summary) via DGX /v1/ner.
-  3. Resolve actors with matching/actors.py; enrich/upsert osint_actors.
-  4. Geolocate: prefer source-provided lat/lon (GDELT/ACLED), fall back to
-     matching/geo.py centroid from NER country.
-  5. Embed text via DGX /v1/embed; try to cluster into an existing event by
-     cosine similarity ≥ EVENT_DEDUP_THRESHOLD within the last 72h.
-  6. Classify event_type (zero-shot LLM via DGX /v1/classify/event); map from
-     source-native codes when available (CAMEO, CVE prefix).
-  7. Verification level from source + corroboration count.
-  8. Persist OsintEvent (if new) + OsintActorEvent + OsintEventArticle; set
-     OsintArticle.event_id so this article is not reprocessed.
+  1. Translate non-English body to English via vLLM chat completion.
+  2. NER on (title + translated body) via local spaCy.
+  3. Resolve actors → osint_actors (upsert).
+  4. Geolocate from source-native fields (GDELT/ACLED lat/lon) or
+     matching/geo.py country centroid.
+  5. Embed via vLLM embeddings.
+  6. Search Qdrant for nearest article in last 72h; if cosine >= 0.88,
+     attach to that event. Else create a new event.
+  7. Upsert embedding into Qdrant with the final event_id + payload.
+  8. Classify event_type from source-native codes (CAMEO/CVE/sanctions/
+     reliefweb), else zero-shot via vLLM chat.
+  9. Persist osint_events + osint_actor_events + osint_event_articles.
 
-Everything is graceful-degrading: if DGX is down the pipeline still lands
-articles with empty actors/event, so future runs can re-enrich.
-
-Compute lives on DGX via `news_pipeline.scoring.client.InferenceClient`.
-Storage is cloud-side (Postgres w/ pgvector + PostGIS).
+Graceful degradation: if vLLM, Qdrant, or spaCy is unavailable, articles still
+land with event_id set but no embedding/actors. They can be reprocessed later
+by re-running the task after re-enabling these modules (event_id rollback: set
+back to NULL in SQL).
 """
 from __future__ import annotations
 
@@ -26,42 +25,34 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
 
+from news_pipeline.clients import qdrant as qclient
+from news_pipeline.clients.vllm import chat, chat_json, embed
 from news_pipeline.matching.actors import resolve as resolve_actor
 from news_pipeline.matching.geo import build_geojson_point, centroid_for_country
 from news_pipeline.matching.lang import is_english
-from news_pipeline.scoring.client import get_client
+from news_pipeline.nlp.ner import ner_batch
 
 
 logger = logging.getLogger(__name__)
 
-EVENT_DEDUP_THRESHOLD = 0.88   # cosine similarity above which we cluster into an existing event
+EVENT_DEDUP_THRESHOLD = 0.88
 EVENT_LOOKBACK_HOURS = 72
 
-# CAMEO root-code → event_type (small mapping; extend as needed)
 CAMEO_TO_EVENT_TYPE: dict[str, str] = {
-    "01": "diplomatic",   # MAKE PUBLIC STATEMENT
-    "02": "diplomatic",   # APPEAL
-    "03": "diplomatic",   # EXPRESS INTENT TO COOPERATE
-    "04": "diplomatic",   # CONSULT
-    "05": "diplomatic",   # ENGAGE IN DIPLOMATIC COOPERATION
-    "06": "economic",     # ENGAGE IN MATERIAL COOPERATION
-    "07": "humanitarian", # PROVIDE AID
-    "08": "diplomatic",   # YIELD
-    "09": "diplomatic",   # INVESTIGATE
-    "10": "diplomatic",   # DEMAND
-    "11": "diplomatic",   # DISAPPROVE
-    "12": "diplomatic",   # REJECT
-    "13": "diplomatic",   # THREATEN
-    "14": "protest",      # PROTEST
-    "15": "armed_conflict", # EXHIBIT FORCE POSTURE
-    "16": "sanctions_change", # REDUCE RELATIONS
-    "17": "armed_conflict", # COERCE
-    "18": "armed_conflict", # ASSAULT
-    "19": "armed_conflict", # FIGHT
-    "20": "armed_conflict", # USE UNCONVENTIONAL MASS VIOLENCE
+    "01": "diplomatic", "02": "diplomatic", "03": "diplomatic", "04": "diplomatic",
+    "05": "diplomatic", "06": "economic", "07": "humanitarian", "08": "diplomatic",
+    "09": "diplomatic", "10": "diplomatic", "11": "diplomatic", "12": "diplomatic",
+    "13": "diplomatic", "14": "protest", "15": "armed_conflict",
+    "16": "sanctions_change", "17": "armed_conflict", "18": "armed_conflict",
+    "19": "armed_conflict", "20": "armed_conflict",
 }
+
+CANDIDATE_EVENT_TYPES = [
+    "armed_conflict", "protest", "cyber_advisory", "cyber_incident",
+    "sanctions_change", "regulatory_action", "humanitarian",
+    "diplomatic", "economic", "other",
+]
 
 
 def _sync_session():
@@ -74,46 +65,44 @@ def _sync_session():
 
 def _upsert_actor(session, actor_id: str, kind: str, name: str) -> None:
     from app.models.osint import OsintActor
-
     existing = session.query(OsintActor).filter_by(id=actor_id).first()
     if existing:
         return
     session.add(OsintActor(id=actor_id, kind=kind, name=name[:500]))
 
 
-def _find_similar_event(session, embedding: list[float]) -> str | None:
-    """Query pgvector HNSW for nearest OsintEvent primary_article embedding.
+def _point_id_for(content_hash: str) -> int:
+    """Qdrant requires int or UUID ids. Use a stable 63-bit hash of content_hash."""
+    return int(hashlib.md5(content_hash.encode()).hexdigest()[:15], 16)
 
-    Uses the article's own embedding and returns the event_id of the nearest
-    article within EVENT_LOOKBACK_HOURS and above EVENT_DEDUP_THRESHOLD.
-    """
-    from sqlalchemy import text
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=EVENT_LOOKBACK_HOURS)
-    # <=> is pgvector's cosine distance operator; 1 - dist = similarity
-    result = session.execute(
-        text("""
-            SELECT event_id, 1 - (embedding <=> (:emb)::vector) AS sim
-            FROM osint_articles
-            WHERE event_id IS NOT NULL
-              AND embedding IS NOT NULL
-              AND fetched_at >= :cutoff
-            ORDER BY embedding <=> (:emb)::vector
-            LIMIT 1
-        """),
-        {"emb": embedding, "cutoff": cutoff},
-    ).first()
-    if not result:
-        return None
-    event_id, sim = result
-    return event_id if sim is not None and sim >= EVENT_DEDUP_THRESHOLD else None
+def _translate(text: str, *, src_lang: str | None) -> str | None:
+    """Translate text to English via vLLM chat. Returns None on failure."""
+    prompt = (
+        f"Translate the following text to English. Reply with ONLY the translation, "
+        f"no preamble or explanation.\n\nText: {text[:2000]}"
+    )
+    return chat(prompt, temperature=0.0, max_tokens=800)
+
+
+def _classify_event_llm(text: str) -> str:
+    """Zero-shot event-type classification via vLLM chat."""
+    types_list = ", ".join(CANDIDATE_EVENT_TYPES)
+    prompt = (
+        f"Classify the following text into ONE of these event types: {types_list}.\n"
+        'Respond with ONLY: {"event_type": "<one of the types>", "confidence": <0-1>}\n\n'
+        f"Text: {text[:1000]}"
+    )
+    data = chat_json(prompt, max_tokens=60)
+    if not data:
+        return "other"
+    et = data.get("event_type", "other")
+    return et if et in CANDIDATE_EVENT_TYPES else "other"
 
 
 def _derive_event_type(article) -> tuple[str | None, str | None]:
-    """Return (event_type, event_code) from source-native fields when possible."""
     raw = article.raw or {}
     src = article.source_kind
-
     if src == "gdelt":
         root = raw.get("EventRootCode") or raw.get("EventBaseCode")
         if root:
@@ -122,21 +111,17 @@ def _derive_event_type(article) -> tuple[str | None, str | None]:
     if src == "acled":
         return "armed_conflict", raw.get("event_type")
     if src == "cisa":
-        cve = raw.get("cve_id")
-        return "cyber_advisory", cve
+        return "cyber_advisory", raw.get("cve_id")
     if src == "sanctions":
         return "sanctions_change", raw.get("programme") or raw.get("regime")
     if src == "reliefweb":
         return "humanitarian", None
-
     return None, None
 
 
 def _derive_location(article) -> dict:
-    """Return {lat, lon, country_code, admin1, name} best-effort."""
     raw = article.raw or {}
     src = article.source_kind
-
     if src == "gdelt":
         lat = raw.get("ActionGeo_Lat")
         lon = raw.get("ActionGeo_Long")
@@ -174,27 +159,20 @@ def _urgency_from_source(article) -> str:
         return "high"
     if src == "sanctions":
         return "medium"
-    if src in ("gdelt",) and raw.get("EventRootCode", "")[:2] in ("18", "19", "20"):
+    if src == "gdelt" and str(raw.get("EventRootCode", ""))[:2] in ("18", "19", "20"):
         return "high"
     return "low"
 
 
 def _verification_from_source(source_kind: str) -> str:
     return {
-        "gdelt": "single_source",
-        "reliefweb": "official",
-        "cisa": "official",
-        "sanctions": "official",
-        "acled": "corroborated",
-        "osint_rss": "single_source",
+        "gdelt": "single_source", "reliefweb": "official", "cisa": "official",
+        "sanctions": "official", "acled": "corroborated", "osint_rss": "single_source",
     }.get(source_kind, "unverified")
 
 
 def process_batch(limit: int = 200) -> dict:
-    """Process OsintArticle rows where event_id IS NULL.
-
-    Returns stats dict.
-    """
+    """Process OsintArticle rows where event_id IS NULL. Returns stats dict."""
     from app.models.osint import (
         OsintArticle,
         OsintEvent,
@@ -202,9 +180,9 @@ def process_batch(limit: int = 200) -> dict:
         osint_event_articles,
     )
 
-    client = get_client()
     session, engine = _sync_session()
-    stats = {"selected": 0, "translated": 0, "nered": 0, "new_events": 0, "clustered": 0, "failed": 0}
+    stats = {"selected": 0, "translated": 0, "nered": 0, "embedded": 0,
+             "new_events": 0, "clustered": 0, "failed": 0}
 
     try:
         rows = (
@@ -218,51 +196,40 @@ def process_batch(limit: int = 200) -> dict:
         if not rows:
             return stats
 
-        # Prepare text for downstream calls; translate non-English if possible.
-        texts_for_inference: list[str] = []
+        # --- 1. Translate non-English bodies via vLLM chat ------------------
+        texts: list[str] = []
         for art in rows:
             body = f"{art.title or ''}. {art.summary or ''}".strip()
-            if art.language and art.language not in ("en", "auto") and client.enabled:
-                tr = client.translate(body, target_lang="en", source_lang=art.language)
-                if tr and tr.get("text"):
-                    art.original_language = art.language
-                    art.translated_text = tr["text"]
-                    art.language = "en"
-                    body = tr["text"]
-                    stats["translated"] += 1
-            elif not is_english(body) and client.enabled:
-                tr = client.translate(body, target_lang="en")
-                if tr and tr.get("text"):
+            needs_translation = (
+                (art.language and art.language not in ("en", "auto"))
+                or not is_english(body)
+            )
+            if needs_translation:
+                translated = _translate(body, src_lang=art.language)
+                if translated:
                     art.original_language = art.language or "auto"
-                    art.translated_text = tr["text"]
+                    art.translated_text = translated
                     art.language = "en"
-                    body = tr["text"]
+                    body = translated
                     stats["translated"] += 1
-            texts_for_inference.append(body[:2000])
+            texts.append(body[:2000])
 
-        # NER in batch.
-        ner_results = client.ner_batch(texts_for_inference) if client.enabled else [[] for _ in rows]
-        ner_results = ner_results or [[] for _ in rows]
+        # --- 2. NER (local spaCy) -------------------------------------------
+        ner_results = ner_batch(texts)
         stats["nered"] = sum(1 for r in ner_results if r)
 
-        # Embeddings in batch.
-        embeddings = client.embed_batch(texts_for_inference) if client.enabled else [None] * len(rows)
-        embeddings = embeddings or [None] * len(rows)
+        # --- 3. Embeddings (vLLM) -------------------------------------------
+        embeddings = embed(texts) or [None] * len(rows)
+        stats["embedded"] = sum(1 for e in embeddings if e is not None)
+
+        # --- 4. Per-article: cluster → event → persist ----------------------
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=EVENT_LOOKBACK_HOURS)
 
         for art, ents, emb in zip(rows, ner_results, embeddings):
             try:
-                # Save embedding
-                if emb is not None:
-                    session.execute(
-                        __import__("sqlalchemy").text(
-                            "UPDATE osint_articles SET embedding = (:emb)::vector WHERE content_hash = :ch"
-                        ),
-                        {"emb": emb, "ch": art.content_hash},
-                    )
-
-                # Actors from NER
-                actor_resolutions: list[tuple[str, str, str, str]] = []  # (actor_id, kind, name, role)
-                for ent in ents[:30]:
+                # Actor resolution
+                actor_resolutions: list[tuple[str, str, str, str]] = []
+                for ent in (ents or [])[:30]:
                     if ent["label"] not in ("PERSON", "ORG", "GPE", "LOC", "NORP"):
                         continue
                     actor_id, kind, name = resolve_actor(ent["text"], ent["label"])
@@ -270,10 +237,18 @@ def process_batch(limit: int = 200) -> dict:
                     role = "location" if ent["label"] in ("GPE", "LOC") else "mentioned"
                     actor_resolutions.append((actor_id, kind, name, role))
 
-                # Event clustering
+                # Event clustering via Qdrant
                 existing_event_id: str | None = None
                 if emb is not None:
-                    existing_event_id = _find_similar_event(session, emb)
+                    hits = qclient.search_similar(
+                        emb,
+                        limit=1,
+                        score_threshold=EVENT_DEDUP_THRESHOLD,
+                        fetched_after=cutoff,
+                        require_event_id=True,
+                    )
+                    if hits:
+                        existing_event_id = hits[0].get("event_id")
 
                 if existing_event_id:
                     art.event_id = existing_event_id
@@ -284,24 +259,21 @@ def process_batch(limit: int = 200) -> dict:
                     )
                     stats["clustered"] += 1
                 else:
-                    # New event
+                    # Derive event_type: source-native first, LLM zero-shot as fallback
                     event_type, event_code = _derive_event_type(art)
-                    if not event_type and client.enabled:
-                        resp = client.classify_event(texts_for_inference[rows.index(art)])
-                        event_type = resp["event_type"] if resp else "other"
-                    event_type = event_type or "other"
+                    if not event_type:
+                        event_type = _classify_event_llm(texts[rows.index(art)])
 
                     loc = _derive_location(art)
-                    if not loc["lat"] and loc["country_code"]:
+                    if loc["lat"] is None and loc["country_code"]:
                         centroid = centroid_for_country(loc["country_code"])
                         if centroid:
                             loc["lat"], loc["lon"] = centroid
 
-                    geojson = build_geojson_point(loc["lat"], loc["lon"])
                     event_id = str(uuid.uuid4())
-                    event_hash = hashlib.md5((art.content_hash + (event_code or "")).encode()).hexdigest()
-
-                    # Summary: first sentence of body (LLM synthesis is optional, deferred)
+                    event_hash = hashlib.md5(
+                        (art.content_hash + (event_code or "")).encode()
+                    ).hexdigest()
                     summary_text = (art.translated_text or art.title or "")[:500]
 
                     session.add(OsintEvent(
@@ -311,21 +283,14 @@ def process_batch(limit: int = 200) -> dict:
                         event_code=str(event_code) if event_code else None,
                         urgency=_urgency_from_source(art),
                         verification_level=_verification_from_source(art.source_kind),
-                        country_code=(loc["country_code"] or None) if loc["country_code"] else None,
+                        country_code=loc["country_code"] or None,
                         admin1=loc.get("admin1"),
                         location_name=loc.get("name"),
-                        location_geojson=geojson,
+                        location_geojson=build_geojson_point(loc["lat"], loc["lon"]),
                         occurred_at=art.published_at,
                         summary=summary_text,
                         primary_article_url=art.url,
                     ))
-                    if loc["lat"] is not None and loc["lon"] is not None:
-                        session.execute(
-                            __import__("sqlalchemy").text(
-                                "UPDATE osint_events SET location = ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography WHERE id = :id"
-                            ),
-                            {"lon": loc["lon"], "lat": loc["lat"], "id": event_id},
-                        )
                     art.event_id = event_id
                     session.execute(
                         osint_event_articles.insert().values(
@@ -333,6 +298,18 @@ def process_batch(limit: int = 200) -> dict:
                         )
                     )
                     stats["new_events"] += 1
+
+                # Qdrant upsert (only after event_id is known)
+                if emb is not None:
+                    qclient.upsert_article(
+                        _point_id_for(art.content_hash),
+                        emb,
+                        content_hash=art.content_hash,
+                        event_id=art.event_id,
+                        fetched_at=art.fetched_at,
+                        source_kind=art.source_kind,
+                        title=art.title,
+                    )
 
                 # Link actors to the event
                 for actor_id, _kind, _name, role in actor_resolutions:
