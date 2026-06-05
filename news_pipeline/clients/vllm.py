@@ -72,7 +72,11 @@ def chat(
                 json={
                     "model": _chat_model(),
                     "messages": messages,
-                    "temperature": temperature,
+                    # Nemotron-3-Super is a reasoning model and REQUIRES temp=1.0 / top_p=0.95
+                    # (NVIDIA spec). Low/zero temps (callers pass 0.0-0.1) cause looping/degraded
+                    # output. Force the spec here so all callers (incl. osint/pipeline temp=0.0) comply.
+                    "temperature": 1.0,
+                    "top_p": 0.95,
                     "max_tokens": max_tokens,
                 },
             )
