@@ -78,6 +78,10 @@ def chat(
                     "temperature": 1.0,
                     "top_p": 0.95,
                     "max_tokens": max_tokens,
+                    # OSINT/sentiment are classification/extraction tasks — disable reasoning so
+                    # the small budgets (200-800 tok) aren't consumed by a <think> trace (which
+                    # would truncate the answer). Nemotron-3-Super emits direct output here.
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
             )
             resp.raise_for_status()
