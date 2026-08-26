@@ -250,6 +250,21 @@ def process_batch(limit: int = 200) -> dict:
                     if hits:
                         existing_event_id = hits[0].get("event_id")
 
+                # Qdrant is a second store and can disagree with Postgres: it is
+                # not written in the same transaction, and nothing deletes from
+                # it when osint_events rows go away. A neighbour's event_id can
+                # therefore name a row that no longer exists — after a retention
+                # purge, or after a transaction that rolled back once the vector
+                # was already upserted. Linking to it blind raises
+                # ForeignKeyViolation on the osint_event_articles insert below,
+                # which rolls the batch back, which strands more vectors: on
+                # 2026-08-25 a residue of 48 poisoned points held the worker at
+                # ~65 tracebacks/min indefinitely. Confirm the row is really
+                # there and fall through to opening a fresh event if it is not.
+                if existing_event_id and not session.get(OsintEvent, existing_event_id):
+                    existing_event_id = None
+                    stats["stale_cluster_refs"] = stats.get("stale_cluster_refs", 0) + 1
+
                 if existing_event_id:
                     art.event_id = existing_event_id
                     stats["clustered"] += 1
