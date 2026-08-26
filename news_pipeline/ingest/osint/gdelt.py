@@ -25,7 +25,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt"
+# https, not http. GDELT began 301-ing http → https around 2026-08-21; httpx does
+# not follow redirects by default (unlike requests), so _fetch_latest_urls raised,
+# fetch_recent swallowed it as a warning and returned [], and the Celery task
+# reported success with {'fetched': 0}. Ingest fell from ~40,000 articles/day to
+# ~0 for five days with every crawl_gdelt run recorded green.
+#
+# The file this returns also lists its CSV paths as http://, so those hit the same
+# redirect — hence follow_redirects=True on the clients below rather than only
+# fixing this constant.
+LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt"
 
 # GDELT 2.0 event schema: 61 columns. See:
 # http://data.gdeltproject.org/documentation/GDELT-Event_Codebook-V2.0.pdf
@@ -52,7 +61,7 @@ EVENT_COLUMNS = [
 
 def _fetch_latest_urls(timeout: float = 15.0) -> dict[str, str]:
     """Parse lastupdate.txt → dict with keys 'export' (events), 'mentions', 'gkg'."""
-    with httpx.Client(timeout=timeout) as c:
+    with httpx.Client(timeout=timeout, follow_redirects=True) as c:
         resp = c.get(LASTUPDATE_URL)
         resp.raise_for_status()
 
@@ -73,7 +82,7 @@ def _fetch_latest_urls(timeout: float = 15.0) -> dict[str, str]:
 
 def _download_csv_zip(url: str, *, timeout: float = 30.0) -> list[list[str]]:
     """Download a zipped CSV, extract, return rows as lists."""
-    with httpx.Client(timeout=timeout) as c:
+    with httpx.Client(timeout=timeout, follow_redirects=True) as c:
         resp = c.get(url)
         resp.raise_for_status()
         data = resp.content
